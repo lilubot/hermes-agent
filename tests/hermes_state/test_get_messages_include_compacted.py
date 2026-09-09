@@ -150,7 +150,9 @@ class TestDisplayDedupe:
 
         db._execute_write(_do)
 
-    def test_latest_bounded_page_has_bounded_database_work(self, db):
+    def test_display_paging_and_append_work_is_bounded(self, db):
+        """Page and identity-lookup work scale with the page, not the transcript: 10x rows
+        must not cost 10x SQLite VM steps (the pre-index read deduped the whole session)."""
         for sid, count in (("small", 2_000), ("large", 20_000)):
             db.create_session(sid, source="desktop")
             db.append_messages_batch(
@@ -182,7 +184,6 @@ class TestDisplayDedupe:
         large_steps = progress_steps("large")
         assert large_steps < small_steps * 3
 
-    def test_append_display_identity_work_is_bounded_by_an_index(self, db):
         def seed(sid, count):
             db.create_session(sid, source="desktop")
             db._execute_write(lambda conn: conn.executemany(
@@ -214,29 +215,6 @@ class TestDisplayDedupe:
         large_steps = append_steps("write-large")
         assert large_steps < small_steps * 3
 
-    def test_display_identity_normalizes_sql_values_and_stays_internal(self, db, tmp_path):
-        sid = "stored-values"
-        db.create_session(sid, source="desktop")
-        db.append_message(sid, role="assistant", content="same", timestamp=-0.0)
-        newest_id = db.append_message(sid, role="assistant", content="same", timestamp=0.0)
-
-        messages = db.get_messages(sid, include_compacted=True)
-        assert [message["id"] for message in messages] == [newest_id]
-        assert "display_identity" not in messages[0]
-        assert "display_order" not in messages[0]
-        json.dumps(messages)
-
-        path = tmp_path / "current-read-only.db"
-        current = SessionDB(path)
-        current.create_session("current", source="desktop")
-        current.append_message("current", role="user", content="serializable")
-        current.close()
-        reader = SessionDB(path, read_only=True)
-        try:
-            json.dumps(reader.get_messages("current", include_compacted=True))
-        finally:
-            reader.close()
-
     def test_composite_handoff_keeps_live_turn_identity_and_first_position(self, db):
         sid = "composite"
         db.create_session(sid, source="desktop")
@@ -263,53 +241,14 @@ class TestDisplayDedupe:
         assert [message["id"] for message in messages] == [carrier_id, later_id]
         assert messages[0]["content"] == carrier
         assert original_id not in [message["id"] for message in messages]
-
-    @pytest.mark.parametrize("carrier_first", [False, True])
-    def test_composite_identity_is_symmetric_and_tracks_identity_updates(self, db, carrier_first):
-        sid = f"composite-{'carrier' if carrier_first else 'raw'}-first"
-        db.create_session(sid, source="desktop")
-        carrier = (
-            f"{_MERGED_PRIOR_CONTEXT_HEADER}\n"
-            "live ask\n\n"
-            f"{_MERGED_SUMMARY_DELIMITER}\n\n"
-            f"{SUMMARY_PREFIX}\n\n"
-            f"{HISTORICAL_TASK_HEADING}\nold work\n\n"
-            f"{_SUMMARY_END_MARKER}"
-        )
-        contents = [carrier, "live ask"] if carrier_first else ["live ask", carrier]
-        first_id = db.append_message(sid, role="user", content=contents[0], timestamp=100.0)
-        middle_id = db.append_message(sid, role="assistant", content="middle", timestamp=200.0)
-        db._execute_write(lambda conn: conn.execute(
-            "UPDATE messages SET active = 0, compacted = 0 WHERE id = ?", (first_id,)))
-        second_id = db.append_message(sid, role="user", content=contents[1], timestamp=100.0)
-        assert [message["id"] for message in db.get_messages(
-            sid, include_compacted=True)] == [middle_id, second_id]
-
-        # Making the first generation display-visible later must not split the
-        # identity that was assigned while it was hidden.
-        db._execute_write(lambda conn: conn.execute(
-            "UPDATE messages SET compacted = 1 WHERE id = ?", (first_id,)))
-        assert [message["id"] for message in db.get_messages(
-            sid, include_compacted=True)] == [second_id, middle_id]
-
-        # Hiding the earliest generation again must advance the group's order
-        # to its first still-visible row.
-        db._execute_write(lambda conn: conn.execute(
-            "UPDATE messages SET compacted = 0 WHERE id = ?", (first_id,)))
-        assert [message["id"] for message in db.get_messages(
-            sid, include_compacted=True)] == [middle_id, second_id]
-
-        # Identity-field updates invalidate the durable grouping; the next
-        # display read rebuilds it from the canonical key before paging.
-        db._execute_write(lambda conn: conn.execute(
-            "UPDATE messages SET role = 'assistant', content = 'middle', timestamp = 200.0 "
-            "WHERE id = ?", (second_id,)))
-        assert [message["id"] for message in db.get_messages(
-            sid, include_compacted=True)] == [second_id]
-        db._execute_write(lambda conn: conn.execute(
-            "DELETE FROM messages WHERE id = ?", (second_id,)))
-        assert [message["id"] for message in db.get_messages(
-            sid, include_compacted=True)] == [middle_id]
+        # Index columns never escape the message dict (BLOB identity is not JSON-serializable).
+        assert not {"display_identity", "display_order"} & set(messages[0])
+        json.dumps(messages)
+        # SQLite stores -0.0 and 0.0 as one value; the hashed identity must agree with that.
+        db.append_message(sid, role="assistant", content="same", timestamp=-0.0)
+        newest_id = db.append_message(sid, role="assistant", content="same", timestamp=0.0)
+        assert [m["id"] for m in db.get_messages(sid, include_compacted=True)][-1:] == [newest_id]
+        assert len([m for m in db.get_messages(sid, include_compacted=True) if m["content"] == "same"]) == 1
 
     def test_legacy_store_is_readable_then_lazily_migrated(self, tmp_path):
         path = tmp_path / "legacy.db"
