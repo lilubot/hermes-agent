@@ -186,6 +186,19 @@ def test_oversized_event_marks_gap_even_with_empty_buffer(monkeypatch):
     assert not event_replay.is_truncated("s1", 1)
     assert not event_replay.is_truncated("s1", 2)
 
+    # The gap watermark never moves backwards: a small frame after an oversized one must
+    # not hide the hole the oversized frame left.
+    reset_replay_state()
+    monkeypatch.setattr(event_replay, "_REPLAY_BUFFER_MAX", 1)
+    monkeypatch.setattr(event_replay, "_REPLAY_BUFFER_BYTES_MAX", 1000)
+    monkeypatch.setattr(event_replay, "_REPLAY_PROCESS_BYTES_MAX", 1000)
+    event_replay._stamp_event(_frame("s"))
+    large = _frame("s")
+    large["params"]["payload"] = {"data": "x" * 2000}
+    event_replay._stamp_event(large)
+    event_replay._stamp_event(_frame("s"))
+    assert event_replay.is_truncated("s", 1)
+
 
 def test_truncation_detection_semantics():
     """The RPC handler's truncated flag: gap between last_seen and buffer start."""
@@ -204,14 +217,3 @@ def test_truncation_detection_semantics():
     assert event_replay.is_truncated("s1", 5)
     # Unknown session: nothing evicted, nothing truncated.
     assert not event_replay.is_truncated("nope", 0)
-
-
-def test_oversized_gap_watermark_never_moves_backwards(monkeypatch):
-    monkeypatch.setattr(event_replay, "_REPLAY_BUFFER_MAX", 1)
-    monkeypatch.setattr(event_replay, "_REPLAY_BUFFER_BYTES_MAX", 1000)
-    event_replay._stamp_event(_frame("s"))
-    large = _frame("s")
-    large["params"]["payload"] = {"data": "x" * 2000}
-    event_replay._stamp_event(large)
-    event_replay._stamp_event(_frame("s"))
-    assert event_replay.is_truncated("s", 1)
