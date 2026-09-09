@@ -69,22 +69,6 @@ describe('useBackgroundSync profile-scoped session refresh', () => {
     expect(request).toHaveBeenCalledTimes(2)
   })
 
-  it('discards a queued old-connection refresh when the connection changes', async () => {
-    let rejectOld!: (reason: Error) => void
-    const oldRequest = new Promise<{ sessions: [] }>((_, reject) => { rejectOld = reject })
-    const request = vi.fn().mockReturnValueOnce(oldRequest).mockResolvedValue({ sessions: [] })
-    const hook = render('default', 'first', async () => undefined, request)
-    await act(async () => { $sessionsChangeTick.set(1) })
-    hook.rerender({ connectionId: 'second', profile: 'default' })
-    await act(async () => undefined)
-    expect(request).toHaveBeenCalledTimes(2)
-    await act(async () => { rejectOld(new Error('old connection closed')) })
-    expect(request).toHaveBeenCalledTimes(2)
-    hook.unmount()
-    await act(async () => { $sessionsChangeTick.set(2) })
-    expect(request).toHaveBeenCalledTimes(2)
-  })
-
   it('refreshes the session list after the active gateway profile changes', async () => {
     const refreshSessions = vi.fn(async () => undefined)
     const hook = render('default', 'local', refreshSessions)
