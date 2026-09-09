@@ -5,7 +5,10 @@ Every event frame through :func:`server.write_json` (hence ``_emit``) gets a per
 with its last seen seq and gets everything newer. Invariants: stdio TUI unaffected (``seq`` only on
 event frames; Ink ignores unknown keys); one lock guards counters + buffers, and write_json already
 serializes per-transport writes so stamping cannot reorder frames; memory bound =
-_REPLAY_BUFFER_MAX events x _REPLAY_SESSIONS_MAX sessions, oldest session evicted FIFO.
+_REPLAY_BUFFER_MAX events AND _REPLAY_BUFFER_BYTES_MAX serialized bytes per session,
+_REPLAY_PROCESS_BYTES_MAX bytes across at most _REPLAY_SESSIONS_MAX sessions, oldest evicted
+FIFO. Evicted or never-retained (oversized) frames leave a truncation watermark so a
+reconnecting client refetches instead of trusting a replay with holes.
 """
 
 from __future__ import annotations
@@ -20,9 +23,13 @@ from collections import OrderedDict, deque
 # epoch lets clients detect the restart and reset their watermarks.
 _REPLAY_EPOCH = uuid.uuid4().hex
 
-# Count limits protect control-frame churn; byte limits protect large tool results.
+# A long turn emits ~hundreds of token events; 512 covers minutes of streaming plus
+# all control events. Desktop users rarely exceed a dozen live chats.
 _REPLAY_BUFFER_MAX = 512
 _REPLAY_SESSIONS_MAX = 64
+# A ring may legitimately hold many bounded 64 KiB tool results (512 of them ≈ 32 MiB per
+# session, ×64 sessions before any cap); bound the serialized bytes so replay memory cannot
+# scale with payload size without limit.
 _REPLAY_BUFFER_BYTES_MAX = 4 * 1024 * 1024
 _REPLAY_PROCESS_BYTES_MAX = 64 * 1024 * 1024
 
@@ -51,13 +58,15 @@ def _stamp_event(obj: dict) -> None:
     if not sid:
         # Session-less global events (skin.changed etc.) are re-fetchable via their own RPCs.
         return
+    # Sizing stays OUTSIDE the lock (same rule as transport.write) so one large payload cannot
+    # stall other threads' frames; ``seq`` is not stamped yet, a few bytes off a MiB budget.
+    size = len(json.dumps(params, ensure_ascii=False, separators=(",", ":")).encode(
+        "utf-8", errors="surrogatepass"))
     with _replay_lock:
         global _replay_total_bytes
         seq = _replay_next_seq.get(sid, 0) + 1
         _replay_next_seq[sid] = seq
         params["seq"] = seq
-        size = len(json.dumps(params, ensure_ascii=False, separators=(",", ":")).encode(
-            "utf-8", errors="surrogatepass"))
         buf = _replay_buffers.get(sid)
         if buf is None:
             buf = _replay_buffers[sid] = deque()
