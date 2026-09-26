@@ -1745,6 +1745,15 @@ class TestRunIdempotency:
     ):
         adapter = auth_adapter
         _use_idempotency_db(adapter, tmp_path / "idem.db")
+        # #958: a declared key must resolve to a live session, so seed one behind
+        # 'memory-a' ('memory-b' never resolves; its conflict returns before resolution).
+        from hermes_state import SessionDB
+
+        db = SessionDB(tmp_path / "state.db")
+        adapter._session_db = db
+        db.create_session(session_id="sess-memory-a", source="api_server", model="m")
+        db.record_gateway_session_peer(
+            "sess-memory-a", source="api_server", session_key="memory-a")
         app = _create_runs_app(adapter)
         async with TestClient(TestServer(app)) as cli:
             with patch.object(adapter, "_create_agent") as create:
@@ -1772,6 +1781,7 @@ class TestRunIdempotency:
                 )
                 assert first.status == 202
                 assert conflict.status == 409
+        db.close()
 
     @pytest.mark.asyncio
     async def test_replay_bypasses_concurrency_limit_and_preserves_session_header(
@@ -1779,6 +1789,14 @@ class TestRunIdempotency:
     ):
         adapter = auth_adapter
         _use_idempotency_db(adapter, tmp_path / "idem.db")
+        # #958: the replayed run's key must resolve to a live session to be admitted.
+        from hermes_state import SessionDB
+
+        db = SessionDB(tmp_path / "state.db")
+        adapter._session_db = db
+        db.create_session(session_id="sess-memory-a", source="api_server", model="m")
+        db.record_gateway_session_peer(
+            "sess-memory-a", source="api_server", session_key="memory-a")
         app = _create_runs_app(adapter)
         async with TestClient(TestServer(app)) as cli:
             with patch.object(adapter, "_create_agent") as create:
@@ -1810,6 +1828,7 @@ class TestRunIdempotency:
                 assert replay_body["run_id"] == first_body["run_id"]
                 assert replay_body["replayed"] is True
                 assert replay.headers["X-Hermes-Session-Key"] == "memory-a"
+        db.close()
 
     @pytest.mark.asyncio
     async def test_direct_status_hydrates_after_adapter_restart(
@@ -1897,6 +1916,152 @@ class TestRunIdempotency:
         assert "run_old" not in adapter._run_idempotency_ids
         assert "run_old" not in adapter._run_owners
 
+
+class TestDeclaredSessionKeyRuns:
+    """A declared X-Hermes-Session-Key must never fail open (#958): when it names no
+    live session the run is refused (typed 404, nothing created), and when it does
+    resolve, the response says so via mode_applied="session_inject". Paths that do
+    not declare the key (no header, body session_id, previous_response_id) are
+    unchanged."""
+
+    KEY = "agent:main:api_server:conv-1"
+
+    @pytest.fixture
+    def declared_adapter(self, auth_adapter, tmp_path):
+        """auth_adapter with its lazy SessionDB pinned to a scratch state.db."""
+        from hermes_state import SessionDB
+
+        db = SessionDB(tmp_path / "state.db")
+        auth_adapter._session_db = db
+        try:
+            yield auth_adapter, db
+        finally:
+            db.close()
+
+    def _seed(self, db, session_id, *, key=KEY):
+        db.create_session(session_id=session_id, source="api_server", model="m")
+        if key:
+            db.record_gateway_session_peer(session_id, source="api_server", session_key=key)
+
+    @staticmethod
+    def _mock_agent(create):
+        agent = MagicMock()
+        agent.run_conversation.return_value = {"final_response": "done"}
+        agent.session_prompt_tokens = agent.session_completion_tokens = (
+            agent.session_total_tokens
+        ) = 0
+        create.return_value = agent
+
+    @pytest.mark.asyncio
+    async def test_ghost_session_key_is_refused_without_creating_a_run(
+        self, declared_adapter
+    ):
+        adapter, db = declared_adapter
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as create:
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={"input": "hello"},
+                    headers={
+                        "Authorization": "Bearer sk-secret",
+                        "X-Hermes-Session-Key": "agent:main:api_server:ghost",
+                    },
+                )
+                body = await resp.json()
+
+                assert resp.status == 404
+                assert body["error"]["code"] == "session_not_found"
+                assert "mode_applied" not in body
+                # Nothing may be created for the refused request: no live transport,
+                # no pollable status row, no queued work, no owner stamp, no agent.
+                assert not adapter._run_streams
+                assert not adapter._run_statuses
+                assert not adapter._run_approval_sessions
+                assert not adapter._active_run_tasks
+                assert not adapter._active_run_agents
+                assert not adapter._run_owners
+                # Durable state stays untouched too: no session row carries the ghost key.
+                assert db.list_sessions_rich(
+                    session_key="agent:main:api_server:ghost") == []
+                create.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_live_session_key_injects_into_the_named_session(
+        self, declared_adapter
+    ):
+        adapter, db = declared_adapter
+        self._seed(db, "sess-live")
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as create:
+                self._mock_agent(create)
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={"input": "hello"},
+                    headers={
+                        "Authorization": "Bearer sk-secret",
+                        "X-Hermes-Session-Key": self.KEY,
+                    },
+                )
+                body = await resp.json()
+
+                assert resp.status == 202
+                assert body["mode_applied"] == "session_inject"
+                assert (
+                    adapter._run_statuses[body["run_id"]]["session_id"] == "sess-live"
+                )
+                for _ in range(40):
+                    poll = await cli.get(
+                        f"/v1/runs/{body['run_id']}",
+                        headers={"Authorization": "Bearer sk-secret"},
+                    )
+                    if (await poll.json()).get("status") == "completed":
+                        break
+                    await asyncio.sleep(0.05)
+                # The agent the run actually built was bound to the declared session.
+                assert create.call_args.kwargs["session_id"] == "sess-live"
+
+    @pytest.mark.asyncio
+    async def test_no_session_key_keeps_fresh_run_behaviour(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as create:
+                self._mock_agent(create)
+                resp = await cli.post("/v1/runs", json={"input": "hello"})
+                body = await resp.json()
+
+                assert resp.status == 202
+                assert "mode_applied" not in body
+                run_id = body["run_id"]
+                # No declared key: the run stays bound to its own fresh id.
+                assert adapter._run_statuses[run_id]["session_id"] == run_id
+
+    @pytest.mark.asyncio
+    async def test_body_session_id_wins_and_ghost_header_is_not_consulted(
+        self, declared_adapter
+    ):
+        adapter, db = declared_adapter
+        self._seed(db, "sess-body", key=None)
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as create:
+                self._mock_agent(create)
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={"input": "hello", "session_id": "sess-body"},
+                    headers={
+                        "Authorization": "Bearer sk-secret",
+                        "X-Hermes-Session-Key": "agent:main:api_server:ghost",
+                    },
+                )
+                body = await resp.json()
+
+                assert resp.status == 202
+                assert "mode_applied" not in body
+                assert (
+                    adapter._run_statuses[body["run_id"]]["session_id"] == "sess-body"
+                )
 
 
 class TestHostedRoomRuns:

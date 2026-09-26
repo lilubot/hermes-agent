@@ -660,6 +660,8 @@ X-Hermes-Session-Key: agent:main:webui:dm:user-42
 
 Rules: max 256 chars, control characters (`\r`, `\n`, `\x00`) are rejected, and the value is echoed back on responses (JSON + SSE). `/v1/capabilities` advertises support via `"session_key_header": "X-Hermes-Session-Key"`. Without the key, Honcho's `per-session` strategy produces a different scope per `session_id` — exactly the behavior Hermes had before.
 
+On `/v1/runs` the header *addresses* the run: when no body `session_id`/`previous_response_id` is sent, the key must resolve to a live session. A key that names no live session is refused with `404` and `{"error": {"code": "session_not_found", ...}}` — no run is created. When it does resolve, the run is injected into that session and the `202` body carries `"mode_applied": "session_inject"`, so callers can distinguish injection from a fresh detached run (no `mode_applied` field means the run was keyed by body session id or its own run id).
+
 Automatic recall follows the **transcript**: the memory provider is initialised once per session and kept across requests, so a continued session (`X-Hermes-Session-Id`, `previous_response_id`, or a declared `X-Hermes-Session-Key` conversation) receives the recall the provider prepared after the previous turn, exactly like a Telegram or Discord chat does. A request without any continuation starts a fresh session and, like the first turn of any new CLI session, has nothing queued yet. Idle sessions release their provider after the same idle TTL as the gateway agent cache (`agent.agent_cache.idle_ttl_secs`, default one hour).
 
 ## System Prompt Handling

@@ -458,13 +458,19 @@ def _resolve_conversation_history(
     return conversation_history, instructions, stored_session_id, None
 
 
-def _accepted_response(run_id: str, status: str, gateway_session_key, *, replayed: bool) -> "web.Response":
-    """202 admission response; replays are flagged via ``Idempotency-Replayed``."""
+def _accepted_response(
+    run_id: str, status: str, gateway_session_key, *, replayed: bool,
+    mode_applied: Optional[str] = None) -> "web.Response":
+    """202 admission response; replays are flagged via ``Idempotency-Replayed``.
+    ``mode_applied`` ("session_inject" when a declared X-Hermes-Session-Key was bound)
+    lets a caller tell injection into the named session from a fresh detached run."""
     headers = {"Idempotency-Replayed": "true"} if replayed else {}
     if gateway_session_key:
         headers["X-Hermes-Session-Key"] = gateway_session_key
-    return web.json_response(
-        {"run_id": run_id, "status": status, "replayed": replayed}, status=202, headers=headers)
+    body: Dict[str, Any] = {"run_id": run_id, "status": status, "replayed": replayed}
+    if mode_applied:
+        body["mode_applied"] = mode_applied
+    return web.json_response(body, status=202, headers=headers)
 
 
 def _replay_or_conflict(self, request, outcome, record, gateway_session_key, _openai_error) -> "web.Response":
@@ -700,6 +706,15 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
     # is what the next same-id run consumes below.
     if selected_session_id:
         selected_session_id = await _resolve_live_session_id(self, str(selected_session_id))
+    if _declared_selected and not selected_session_id:
+        # #958: a declared key naming no live session must refuse, not fail open — the
+        # run_id fallback minted a brand-new detached session (HTTP 202, rogue-executor
+        # class). No run state is created; the caller retries with a resolvable key.
+        self._run_owners.pop(run_id, None)
+        return _json_error(
+            _openai_error,
+            f"No live session for X-Hermes-Session-Key: {gateway_session_key}",
+            code="session_not_found", status=404)
     session_id = selected_session_id or run_id
     # History loads for the session the request actually selected — including one resolved from
     # a declared X-Hermes-Session-Key, whose persisted delivery rows must reach the next
@@ -753,7 +768,9 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
         self._background_tasks.add(task)  # tracked for shutdown drain
     if hasattr(task, "add_done_callback"):
         task.add_done_callback(self._background_tasks.discard)
-    return _accepted_response(run_id, "started", gateway_session_key, replayed=False)
+    return _accepted_response(
+        run_id, "started", gateway_session_key, replayed=False,
+        mode_applied="session_inject" if _declared_selected else None)
 
 
 def _run_usage(agent) -> Dict[str, int]:
