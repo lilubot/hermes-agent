@@ -48,6 +48,8 @@ def _payload(pr_number=None, action: str = "synchronize") -> bytes:
     ({**_coalesce_route(), "coalesce": "pull_request.number"}, "coalesce block"),
     (_coalesce_route(key="pull_request.number", window_seconds=0), "window_seconds"),
     (_coalesce_route(key="pull_request.number", max_wait_seconds=True), "max_wait_seconds"),
+    (_coalesce_route(key="pull_request.number", in_flight_max_seconds=-1), "in_flight_max_seconds"),
+    (_coalesce_route(key="pull_request.number", single_flight="yes"), "single_flight"),
     ({**_coalesce_route(), "deliver_only": True, "deliver": "telegram"}, "deliver_only"),
     ({**_coalesce_route(), "cron_job": "sweeper"}, "cron_job"),
 ])
@@ -124,3 +126,80 @@ async def test_disconnect_flushes_pending_groups():
     assert adapter.handle_message.call_count == 1
     assert adapter.handle_message.call_args[0][0].message_id == "pend"
     assert adapter._coalescer.pending == {}
+
+
+def _blocking_handler(gate: asyncio.Event):
+    """handle_message stand-in that runs until *gate* is set, like a real agent turn."""
+    calls = []
+
+    async def _handle(event):
+        calls.append(event)
+        await gate.wait()
+
+    return _handle, calls
+
+
+@pytest.mark.asyncio
+async def test_single_flight_holds_newer_events_until_active_run_completes():
+    """Six check_suite completions on one push: the first settles into a run; the rest coalesce and are
+    HELD (not dispatched in parallel) until that run finishes, then exactly one follow-up run carries the
+    newest event. A different PR is unaffected by the gate."""
+    adapter = _make_adapter(routes={"pr": _coalesce_route(key="pull_request.number", window_seconds=0.02)})
+    gate = asyncio.Event()
+    adapter.handle_message, calls = _blocking_handler(gate)
+
+    await adapter._handle_webhook(_mock_request(_payload(7, "opened"), delivery_id="first"))
+    await asyncio.sleep(0.05)
+    assert [e.message_id for e in calls] == ["first"]
+    assert "pr|7" in adapter._coalescer.active
+
+    for i in range(5):
+        await adapter._handle_webhook(_mock_request(_payload(7, "synchronize"), delivery_id=f"burst{i}"))
+    await adapter._handle_webhook(_mock_request(_payload(8, "opened"), delivery_id="other"))
+    await asyncio.sleep(0.08)
+    # Burst settled but held; PR 8 ran (its own gate), PR 7 still has exactly one run in flight.
+    assert [e.message_id for e in calls] == ["first", "other"]
+    assert adapter._coalescer.pending["pr|7"].delivery_id == "burst4"
+    assert "pr|7" not in adapter._coalescer._timers
+
+    gate.set()
+    await asyncio.sleep(0.05)
+    assert [e.message_id for e in calls] == ["first", "other", "burst4"]
+    assert "5 webhook events" in calls[-1].text
+    assert adapter._coalescer.pending == {}
+    await asyncio.sleep(0.02)
+    assert adapter._coalescer.active == {}
+
+
+@pytest.mark.asyncio
+async def test_single_flight_off_dispatches_concurrently():
+    adapter = _make_adapter(routes={"pr": _coalesce_route(key="pull_request.number", window_seconds=0.02,
+                                                          single_flight=False)})
+    gate = asyncio.Event()
+    adapter.handle_message, calls = _blocking_handler(gate)
+    await adapter._handle_webhook(_mock_request(_payload(7, "opened"), delivery_id="a"))
+    await asyncio.sleep(0.05)
+    await adapter._handle_webhook(_mock_request(_payload(7, "synchronize"), delivery_id="b"))
+    await asyncio.sleep(0.05)
+    assert [e.message_id for e in calls] == ["a", "b"]
+    assert adapter._coalescer.active == {}
+    gate.set()
+
+
+@pytest.mark.asyncio
+async def test_single_flight_gate_expires_when_run_never_completes():
+    adapter = _make_adapter(routes={"pr": _coalesce_route(key="pull_request.number", window_seconds=0.02,
+                                                          in_flight_max_seconds=0.05)})
+    gate = asyncio.Event()
+    adapter.handle_message, calls = _blocking_handler(gate)
+    await adapter._handle_webhook(_mock_request(_payload(7, "opened"), delivery_id="stuck"))
+    await asyncio.sleep(0.03)
+    await adapter._handle_webhook(_mock_request(_payload(7, "synchronize"), delivery_id="late"))
+    await asyncio.sleep(0.03)
+    assert [e.message_id for e in calls] == ["stuck"]  # within in_flight_max: held
+    await asyncio.sleep(0.05)
+    await adapter._handle_webhook(_mock_request(_payload(7, "synchronize"), delivery_id="later"))
+    await asyncio.sleep(0.05)
+    assert [e.message_id for e in calls] == ["stuck", "later"]  # gate expired: released without a completion
+    assert adapter._coalescer.active["pr|7"][0] == "later"
+    gate.set()

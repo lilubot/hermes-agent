@@ -6,6 +6,13 @@ run. Coalescing groups events by a payload-derived key and debounces them: only 
 of a group is dispatched once the quiet window passes, bounded by ``max_wait_seconds`` past the
 group's first event so a steady stream cannot starve dispatch (one durable run per entity, stale
 heads superseded). #92066
+
+Single-flight (``single_flight``, default on): a group whose run is still executing holds any
+newer settled event instead of spawning a second concurrent run on the same entity; the held
+event (always the newest) dispatches when the active run finishes. Six workflow ``check_suite``
+completions on one push therefore yield one evaluation at a time, never six parallel ones that
+each re-census the PR and post competing verdicts. A run that never reports completion releases
+the gate after ``in_flight_max_seconds`` so a lost callback cannot wedge an entity forever.
 """
 
 from __future__ import annotations
@@ -21,6 +28,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_WINDOW_SECONDS = 30.0
 DEFAULT_MAX_WAIT_SECONDS = 300.0
+DEFAULT_IN_FLIGHT_MAX_SECONDS = 1800.0
 _PLACEHOLDER_RE = re.compile(r"\{[a-zA-Z0-9_.]+\}")
 
 
@@ -39,10 +47,13 @@ def validate_coalesce_config(route_name: str, route: dict) -> None:
         raise ValueError(f"[webhook] Route '{route_name}' has a coalesce block without a non-empty string 'key'. "
                          f"Set coalesce.key to a payload field (e.g. 'pull_request.number') or a template "
                          f"(e.g. '{{repository.full_name}}#{{number}}').")
-    for field in ("window_seconds", "max_wait_seconds"):
+    for field in ("window_seconds", "max_wait_seconds", "in_flight_max_seconds"):
         value = coalesce.get(field)
         if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0):
             raise ValueError(f"[webhook] Route '{route_name}' coalesce.{field} must be a positive number, got {value!r}.")
+    single_flight = coalesce.get("single_flight")
+    if single_flight is not None and not isinstance(single_flight, bool):
+        raise ValueError(f"[webhook] Route '{route_name}' coalesce.single_flight must be a boolean, got {single_flight!r}.")
 
 
 @dataclass
@@ -54,6 +65,8 @@ class PendingEvent:
     first_at: float
     count: int
     dispatch_kwargs: Dict[str, Any]
+    single_flight: bool = True
+    in_flight_max: float = DEFAULT_IN_FLIGHT_MAX_SECONDS
 
     def prompt_with_note(self) -> str:
         if self.count <= 1:
@@ -64,17 +77,25 @@ class PendingEvent:
 
 class WebhookCoalescer:
     """Debounce-and-supersede buffer. ``dispatch(payload, prompt, delivery_id, **kwargs)`` is the adapter's
-    agent-run spawner. Only ever driven from the aiohttp event loop → no locking."""
+    agent-run spawner; when it returns a future, its completion releases the group's single-flight gate.
+    Only ever driven from the aiohttp event loop → no locking."""
 
     def __init__(self, dispatch: Callable[..., Any], render: Callable[[str, dict, str, str], str]):
         self._dispatch = dispatch
         self._render = render
         self._pending: Dict[str, PendingEvent] = {}
         self._timers: Dict[str, asyncio.Task] = {}
+        # group_key → (delivery_id, started_at) of the run currently executing for that entity.
+        self._active: Dict[str, tuple[str, float]] = {}
+        self._group_of_delivery: Dict[str, str] = {}
 
     @property
     def pending(self) -> Dict[str, PendingEvent]:
         return self._pending
+
+    @property
+    def active(self) -> Dict[str, tuple[str, float]]:
+        return self._active
 
     def group_key(self, route_name: str, key_template: str, payload: dict, event_type: str) -> Optional[str]:
         """``"{route}|{rendered key}"`` for a bare dotted field or a brace template; ``None`` when a field did
@@ -101,8 +122,10 @@ class WebhookCoalescer:
         first_at = existing.first_at if existing else now
         count = existing.count + 1 if existing else 1
         dispatch_kwargs = {**dispatch_kwargs, "route_name": route_name, "event_type": event_type}
-        self._pending[group_key] = PendingEvent(payload=payload, prompt=prompt, delivery_id=delivery_id,
-                                                first_at=first_at, count=count, dispatch_kwargs=dispatch_kwargs)
+        self._pending[group_key] = PendingEvent(
+            payload=payload, prompt=prompt, delivery_id=delivery_id, first_at=first_at, count=count,
+            dispatch_kwargs=dispatch_kwargs, single_flight=bool(coalesce.get("single_flight", True)),
+            in_flight_max=float(coalesce.get("in_flight_max_seconds", DEFAULT_IN_FLIGHT_MAX_SECONDS)))
         if existing is not None:
             logger.info("[webhook] coalesced delivery %s superseded by %s (group=%s, %d events)",
                         existing.delivery_id, delivery_id, group_key, count)
@@ -125,11 +148,54 @@ class WebhookCoalescer:
         if entry is not None:
             self._settle(group_key, entry)
 
-    def _settle(self, group_key: str, entry: PendingEvent) -> Any:
+    def _settle(self, group_key: str, entry: PendingEvent, *, force: bool = False) -> Any:
+        now = time.time()
+        if entry.single_flight:
+            active = self._active.get(group_key)
+            if active is not None and now - active[1] >= entry.in_flight_max:
+                logger.warning("[webhook] single-flight gate for group=%s expired after %.0fs without a completion "
+                               "for delivery %s — releasing", group_key, now - active[1], active[0])
+                self._release_group(group_key)
+                active = None
+            if active is not None and not force:
+                # Hold (pending, no timer): newer events keep superseding it; ``release`` settles it.
+                self._pending[group_key] = entry
+                logger.info("[webhook] coalesce held group=%s delivery=%s — run %s still in flight",
+                            group_key, entry.delivery_id, active[0])
+                return None
+            self._active[group_key] = (entry.delivery_id, now)
+            self._group_of_delivery[entry.delivery_id] = group_key
         logger.info("[webhook] coalesce settled group=%s events=%d delivery=%s", group_key, entry.count,
                     entry.delivery_id)
-        return self._dispatch(entry.payload, entry.prompt_with_note(), entry.delivery_id, time.time(),
-                              **entry.dispatch_kwargs)
+        try:
+            result = self._dispatch(entry.payload, entry.prompt_with_note(), entry.delivery_id, now,
+                                    **entry.dispatch_kwargs)
+        except Exception:
+            self.release(entry.delivery_id)
+            raise
+        if entry.single_flight and isinstance(result, asyncio.Future):
+            result.add_done_callback(lambda _task, delivery_id=entry.delivery_id: self.release(delivery_id))
+        return result
+
+    def _release_group(self, group_key: str) -> None:
+        active = self._active.pop(group_key, None)
+        if active is not None:
+            self._group_of_delivery.pop(active[0], None)
+
+    def release(self, delivery_id: str) -> None:
+        """A run finished (any outcome): open the entity's gate and dispatch the held event, if one is waiting.
+        A held event has no timer — its quiet window already elapsed — so it goes out immediately."""
+        group_key = self._group_of_delivery.pop(delivery_id, None)
+        if group_key is None:
+            return
+        active = self._active.get(group_key)
+        if active is not None and active[0] == delivery_id:
+            self._active.pop(group_key, None)
+        if group_key in self._timers:
+            return  # a newer event re-armed the window; its timer settles the group
+        held = self._pending.pop(group_key, None)
+        if held is not None:
+            self._settle(group_key, held)
 
     async def flush(self) -> None:
         """Dispatch every pending group now and wait until each run is handed to the runner, so an adapter
@@ -142,7 +208,7 @@ class WebhookCoalescer:
         handed_off = []
         for group_key, entry in pending.items():
             try:
-                handed_off.append(self._settle(group_key, entry))
+                handed_off.append(self._settle(group_key, entry, force=True))
             except Exception:
                 logger.exception("[webhook] failed to flush coalesced group %s", group_key)
         awaitables = [t for t in handed_off if isinstance(t, asyncio.Future)]
